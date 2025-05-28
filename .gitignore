@@ -1,0 +1,9 @@
+.env
+data/
+postgres-data/
+postgres-data-backup/
+postgres-extras-data/
+qdrant_data/
+letsencrypt/
+.llm.env
+crawl4ai/

@@ -1,0 +1,253 @@
+version: "3.8"
+
+services:
+  # -------------------------------------
+  # Traefik
+  # -------------------------------------
+  traefik:
+    image: "traefik:v2.10"
+    container_name: "traefik"
+    restart: always
+    command:
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.myresolver.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./letsencrypt:/letsencrypt"
+    networks:
+      - traefik
+
+  # -------------------------------------
+  # Redis (Queue backend)
+  # -------------------------------------
+  redis:
+    image: redis:6
+    container_name: "redis-n8n"
+    restart: always
+    networks:
+      - traefik
+
+  # -------------------------------------
+  # Postgres (solo para n8n)
+  # -------------------------------------
+  postgres:
+    image: postgres:14.9
+    container_name: "postgres-n8n"
+    restart: always
+    environment:
+      - POSTGRES_USER=${DB_POSTGRESDB_USER}
+      - POSTGRES_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+      - POSTGRES_DB=${DB_POSTGRESDB_DATABASE}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - traefik
+    command: >
+      postgres
+      -c max_connections=200
+      -c idle_in_transaction_session_timeout=300000
+      -c idle_session_timeout=300000
+
+  # -------------------------------------
+  # Postgres extras (hilos de chat, etc.)
+  # -------------------------------------
+  postgres-chat:
+    image: postgres:14.9
+    container_name: "postgres-extras"
+    restart: always
+    environment:
+      - POSTGRES_USER=${CHAT_DB_USER}
+      - POSTGRES_PASSWORD=${CHAT_DB_PASSWORD}
+      - POSTGRES_DB=${CHAT_DB_DATABASE}
+    volumes:
+      - ./postgres-extras-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - traefik
+
+  # -------------------------------------
+  # n8n-main (UI + Webhooks, no ejecuta)
+  # -------------------------------------
+  n8n-main:
+    image: n8nio/n8n:latest
+    user: "node"
+    container_name: "n8n-main"
+    restart: always
+    depends_on:
+      - traefik
+      - postgres
+      - redis
+    expose:
+      - "5678"
+    volumes:
+      - ./data:/home/node/.n8n
+      - ./workflows:/home/node/exported_workflows
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_HOST=${DOMAIN}
+      - WEBHOOK_TUNNEL_URL=https://${DOMAIN}
+      - WEBHOOK_URL=https://${DOMAIN}
+      - VUE_APP_URL_BASE_API=https://${DOMAIN}/
+      - N8N_PROTOCOL=${N8N_PROTOCOL}
+      - NODE_ENV=production
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=${DB_POSTGRESDB_HOST}
+      - DB_POSTGRESDB_PORT=${DB_POSTGRESDB_PORT}
+      - DB_POSTGRESDB_USER=${DB_POSTGRESDB_USER}
+      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+      - DB_POSTGRESDB_DATABASE=${DB_POSTGRESDB_DATABASE}
+      - N8N_PROXY_HOPS=1
+      # --- Queue Mode ---
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=${REDIS_HOST}
+      - QUEUE_BULL_REDIS_PORT=${REDIS_PORT}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=myresolver"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+    networks:
+      - traefik
+
+  # -------------------------------------
+  # Crawl4AI (API + Playground)
+  # -------------------------------------
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: "crawl4ai"
+    restart: always
+    env_file:
+      - ./.llm.env
+    volumes:
+      - /dev/shm:/dev/shm
+    expose:
+      - "11235"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.crawl4ai.rule=Host(`crawl.${DOMAIN}`)"
+      - "traefik.http.routers.crawl4ai.entrypoints=websecure"
+      - "traefik.http.routers.crawl4ai.tls.certresolver=myresolver"
+      - "traefik.http.services.crawl4ai.loadbalancer.server.port=11235"
+    networks:
+      - traefik
+    environment:
+      - C4AI_MAX_CONCURRENT_BROWSERS=1
+      - C4AI_MEMORY_THRESHOLD_PERCENT=80
+      - C4AI_TEXT_MODE=true
+      - C4AI_SEMAPHORE_COUNT=1
+
+  # -------------------------------------
+  # n8n-workers (Worker #1, 2 y 3)
+  # -------------------------------------
+  n8n-worker:
+    image: n8nio/n8n:latest
+    container_name: "n8n-worker"
+    user: "node"
+    restart: always
+    depends_on:
+      - redis
+      - postgres
+    expose:
+      - "5678"
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=${DB_POSTGRESDB_HOST}
+      - DB_POSTGRESDB_PORT=${DB_POSTGRESDB_PORT}
+      - DB_POSTGRESDB_USER=${DB_POSTGRESDB_USER}
+      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+      - DB_POSTGRESDB_DATABASE=${DB_POSTGRESDB_DATABASE}
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=${REDIS_HOST}
+      - QUEUE_BULL_REDIS_PORT=${REDIS_PORT}
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - N8N_PROXY_HOPS=1
+    volumes:
+      - ./data:/home/node/.n8n
+      - ./workflows:/home/node/exported_workflows
+    entrypoint: ["n8n", "worker"]
+    networks:
+      - traefik
+
+  n8n-worker-2:
+    image: n8nio/n8n:latest
+    container_name: "n8n-worker-2"
+    user: "node"
+    restart: always
+    depends_on:
+      - redis
+      - postgres
+    expose:
+      - "5678"
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=${DB_POSTGRESDB_HOST}
+      - DB_POSTGRESDB_PORT=${DB_POSTGRESDB_PORT}
+      - DB_POSTGRESDB_USER=${DB_POSTGRESDB_USER}
+      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+      - DB_POSTGRESDB_DATABASE=${DB_POSTGRESDB_DATABASE}
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=${REDIS_HOST}
+      - QUEUE_BULL_REDIS_PORT=${REDIS_PORT}
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - N8N_PROXY_HOPS=1
+    volumes:
+      - ./data:/home/node/.n8n
+      - ./workflows:/home/node/exported_workflows
+    entrypoint: ["n8n", "worker"]
+    networks:
+      - traefik
+
+  n8n-worker-3:
+    image: n8nio/n8n:latest
+    container_name: "n8n-worker-3"
+    user: "node"
+    restart: always
+    depends_on:
+      - redis
+      - postgres
+    expose:
+      - "5678"
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=${DB_POSTGRESDB_HOST}
+      - DB_POSTGRESDB_PORT=${DB_POSTGRESDB_PORT}
+      - DB_POSTGRESDB_USER=${DB_POSTGRESDB_USER}
+      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+      - DB_POSTGRESDB_DATABASE=${DB_POSTGRESDB_DATABASE}
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=${REDIS_HOST}
+      - QUEUE_BULL_REDIS_PORT=${REDIS_PORT}
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - N8N_PROXY_HOPS=1
+    volumes:
+      - ./data:/home/node/.n8n
+      - ./workflows:/home/node/exported_workflows
+    entrypoint: ["n8n", "worker"]
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true
