@@ -19,3 +19,8 @@ chmod -R 775 "$WORKFLOW_DIR"
 # Borra caché de git para asegurar que ve los cambios
 cd /opt/n8n
 git update-index --really-refresh
+
+# Añade y comitea
+git add workflows
+git commit -m "Backup workflows $TIMESTAMP"
+echo "✅ Backup de workflows exportado, copiado y versionado en Git correctamente: $WORKFLOW_DIR/export_${TIMESTAMP}.json"
